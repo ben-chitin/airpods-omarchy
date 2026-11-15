@@ -25,6 +25,10 @@ from gi.repository import GLib
 AAP_UUID = "74ec2172-0bad-4d01-8f77-997b2be0722a"
 PSM = 0x1001
 STATE_FILE = os.path.expanduser("~/.local/state/omarchy/airpods.json")
+# Where the running backend takes commands from `airpods status` and
+# `airpods mode`. The AirPods talk to one channel per computer, so a second
+# connection from here would take the bar's updates away from it.
+SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "airpods-omarchy.sock")
 
 HANDSHAKE = bytes.fromhex("00000400010002000000000000000000")
 FEATURES = bytes.fromhex("040004004d00ff00000000000000")
@@ -399,6 +403,7 @@ class Backend:
         verb, args = words[0], words[1:]
         if verb == "mode" and args and args[0] in MODE_BYTES:
             self.send(control(CTL_MODE, MODE_BYTES[args[0]]))
+            GLib.timeout_add(1500, self.confirm_mode, args[0], len(args) > 1)
         elif verb == "conversation" and args:
             on = args[0] == "on"
             self.send(control(CTL_CONVERSATION, 1 if on else 2))
@@ -421,6 +426,18 @@ class Backend:
                 self.look()
         self.emit()
 
+    def confirm_mode(self, wanted, retried):
+        """The AirPods answer a mode change by reporting the new mode. Silence
+        means the channel went dead without closing, which happens when
+        another program opens its own: reconnect and ask once more."""
+        if self.sock is None or self.mode == wanted or retried:
+            return False
+        self.disconnect()
+        self.look()
+        if self.sock is not None:
+            GLib.timeout_add(800, lambda: self.command("mode %s again" % wanted) and False)
+        return False
+
     def stdin_ready(self, _fd, condition):
         if condition & (GLib.IO_HUP | GLib.IO_ERR):
             self.quit()
@@ -430,6 +447,40 @@ class Backend:
             self.quit()
             return False
         self.command(line.strip())
+        return True
+
+    def listen(self):
+        try:
+            os.unlink(SOCKET)
+        except OSError:
+            pass
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(SOCKET)
+        os.chmod(SOCKET, 0o600)
+        self.server.listen(4)
+        GLib.io_add_watch(self.server.fileno(), GLib.IO_IN, self.client_ready)
+
+    def client_ready(self, _fd, _condition):
+        """A command from the command line: run it, answer with the state."""
+        try:
+            client, _ = self.server.accept()
+            client.settimeout(1)
+            line = client.recv(256).decode("utf-8", "replace").strip()
+        except OSError:
+            return True
+        if line:
+            self.command(line)
+
+        def answer():
+            try:
+                client.sendall(json.dumps(self.state()).encode())
+            except OSError:
+                pass
+            client.close()
+            return False
+
+        # Long enough for the AirPods to confirm a change.
+        GLib.timeout_add(700 if line else 0, answer)
         return True
 
     def device_changed(self, interface, changed, _invalidated, path=None):
@@ -450,6 +501,7 @@ class Backend:
                                      "org.freedesktop.DBus.Properties", "org.bluez",
                                      path_keyword="path")
         GLib.io_add_watch(sys.stdin.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.stdin_ready)
+        self.listen()
         self.look()
         self.emit()
         try:
@@ -457,10 +509,42 @@ class Backend:
         except KeyboardInterrupt:
             pass
         self.unduck()
+        try:
+            os.unlink(SOCKET)
+        except OSError:
+            pass
+
+
+def ask(command):
+    """Hand a command to the running backend. None if there isn't one."""
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(4)
+        client.connect(SOCKET)
+        client.sendall((command or "").encode() + b"\n")
+        data = b""
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data)
+    except (OSError, ValueError):
+        return None
 
 
 def once(command=None):
-    """Connect, optionally send one mode change, and print what comes back."""
+    """Print what the AirPods report, after an optional mode change. Goes
+    through the bar's backend when it is running, and connects itself when
+    it is not."""
+    state = ask(command)
+    if state is not None:
+        if not state.get("connected"):
+            print("No AirPods are connected.", file=sys.stderr)
+            return 1
+        del state["type"]
+        print(json.dumps(state, indent=2))
+        return 0
     backend = Backend(emit=False)
     found = backend.find()
     if not found:
