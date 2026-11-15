@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "bhj.airpods",
+  "name": "AirPods",
+  "version": "1.0.0",
+  "author": "bhj",
+  "description": "Battery, noise control and in-ear pause for AirPods, in the bar.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "AirPods",
+    "description": "Battery of each AirPod and the case, the noise control mode, and pausing when one is taken out.",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  },
+  "keepLoaded": true
+}

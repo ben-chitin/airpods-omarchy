@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""Backend of the AirPods bar widget.
+
+Talks to connected AirPods over Apple's accessory protocol (AAP, an L2CAP
+channel on PSM 0x1001) the way an iPhone does: reads battery, in-ear state and
+the noise control mode, and changes the mode. The protocol notes come from the
+LibrePods project (github.com/kavishdevar/librepods).
+
+  airpods serve     run for the bar: a JSON state line on stdout per change,
+                    a command per line on stdin
+  airpods status    connect, print what the AirPods report, and exit
+  airpods mode <off|transparency|adaptive|anc>
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+
+import dbus
+import dbus.mainloop.glib
+from gi.repository import GLib
+
+AAP_UUID = "74ec2172-0bad-4d01-8f77-997b2be0722a"
+PSM = 0x1001
+STATE_FILE = os.path.expanduser("~/.local/state/omarchy/airpods.json")
+
+HANDSHAKE = bytes.fromhex("00000400010002000000000000000000")
+FEATURES = bytes.fromhex("040004004d00ff00000000000000")
+NOTIFY = bytes.fromhex("040004000f00ffffffff")
+
+MODES = {1: "off", 2: "anc", 3: "transparency", 4: "adaptive"}
+MODE_BYTES = {name: byte for byte, name in MODES.items()}
+EARS = {0: "ear", 1: "out", 2: "case"}
+PARTS = {2: "right", 4: "left", 8: "case", 1: "headphone"}
+
+CTL_MODE = 0x0D
+CTL_CONVERSATION = 0x28
+CTL_ALLOW_OFF = 0x34
+
+
+def control(identifier, value):
+    return bytes([4, 0, 4, 0, 9, 0, identifier, value, 0, 0, 0])
+
+
+class Backend:
+    def __init__(self, emit=True):
+        self.emit_enabled = emit
+        self.bus = dbus.SystemBus()
+        self.session = None
+        self.sock = None
+        self.watch = None
+        self.address = ""
+        self.retry = None
+        self.attempts = 0
+        self.last_line = ""
+        # AirPods paired here but connected elsewhere, or in their case.
+        self.known = None
+        self.connecting = False
+        self.error = ""
+        self.settings = {"autopause": True, "duck": True}
+        self.load_settings()
+        self.clear()
+
+    # ---- state -----------------------------------------------------------
+
+    def clear(self):
+        self.name = ""
+        self.model = ""
+        self.mode = ""
+        self.allow_off = False
+        self.conversation = None
+        self.battery = {}
+        self.ears = []
+        self.paused = []
+        self.ducked = None
+
+    def load_settings(self):
+        try:
+            with open(STATE_FILE) as handle:
+                saved = json.load(handle)
+            for key in self.settings:
+                if isinstance(saved.get(key), bool):
+                    self.settings[key] = saved[key]
+        except (OSError, ValueError):
+            pass
+
+    def save_settings(self):
+        try:
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            with open(STATE_FILE, "w") as handle:
+                json.dump(self.settings, handle)
+        except OSError:
+            pass
+
+    def state(self):
+        return {
+            "type": "state",
+            "connected": self.sock is not None,
+            "known": self.known[1] if self.known and self.sock is None else "",
+            "connecting": self.connecting and self.sock is None,
+            "error": self.error if self.sock is None else "",
+            "name": self.name,
+            "model": self.model,
+            "mode": self.mode,
+            "allowOff": self.allow_off,
+            "conversation": self.conversation is True,
+            "battery": self.battery,
+            "ears": self.ears,
+            "autopause": self.settings["autopause"],
+            "duck": self.settings["duck"],
+        }
+
+    def emit(self):
+        if not self.emit_enabled:
+            return
+        line = json.dumps(self.state(), separators=(",", ":"))
+        if line == self.last_line:
+            return
+        self.last_line = line
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except OSError:
+            self.quit()
+
+    # ---- finding and connecting ------------------------------------------
+
+    def find(self):
+        """The first connected Bluetooth device that speaks AAP. Also notes
+        one that is paired but not connected, for the Connect button."""
+        manager = dbus.Interface(self.bus.get_object("org.bluez", "/"),
+                                 "org.freedesktop.DBus.ObjectManager")
+        self.known = None
+        for path, interfaces in manager.GetManagedObjects().items():
+            device = interfaces.get("org.bluez.Device1")
+            if not device:
+                continue
+            if AAP_UUID not in [str(u).lower() for u in device.get("UUIDs", [])]:
+                continue
+            name = str(device.get("Alias", "AirPods"))
+            if device.get("Connected"):
+                return str(device["Address"]), name
+            if device.get("Paired") and self.known is None:
+                self.known = (str(path), name)
+        return None
+
+    def connect_known(self):
+        """Ask BlueZ to bring the paired AirPods over to this computer."""
+        if self.sock is not None or self.connecting:
+            return
+        try:
+            self.find()
+        except dbus.DBusException:
+            pass
+        if not self.known:
+            return
+        self.connecting = True
+        self.error = ""
+        device = dbus.Interface(self.bus.get_object("org.bluez", self.known[0]), "org.bluez.Device1")
+        device.Connect(reply_handler=self.connect_done, error_handler=self.connect_failed, timeout=25)
+
+    def connect_done(self):
+        self.connecting = False
+        self.schedule(500)
+        self.emit()
+
+    def connect_failed(self, _error):
+        self.connecting = False
+        self.error = "Couldn't reach them. Open the case lid or put one in your ear, then try again."
+        self.emit()
+
+    def look(self):
+        self.retry = None
+        if self.sock is not None:
+            return False
+        try:
+            found = self.find()
+        except dbus.DBusException:
+            found = None
+        if not found:
+            self.attempts = 0
+            self.emit()
+            return False
+        address, name = found
+        try:
+            self.connect(address, name)
+            self.attempts = 0
+        except OSError:
+            # BlueZ reports the device connected a moment before the AirPods
+            # accept the channel, and they refuse it while another host has
+            # them. Keep trying, slower as it goes.
+            self.attempts += 1
+            self.schedule(min(2000 * self.attempts, 15000))
+        return False
+
+    def schedule(self, delay):
+        if self.retry is None:
+            self.retry = GLib.timeout_add(delay, self.look)
+
+    def connect(self, address, name):
+        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+        sock.settimeout(6)
+        try:
+            sock.connect((address, PSM))
+            sock.send(HANDSHAKE)
+            sock.send(FEATURES)
+            sock.send(NOTIFY)
+        except OSError:
+            sock.close()
+            raise
+        sock.setblocking(False)
+        self.clear()
+        self.sock = sock
+        self.connecting = False
+        self.error = ""
+        self.address = address
+        self.name = name
+        self.watch = GLib.io_add_watch(sock.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.readable)
+        self.emit()
+
+    def disconnect(self):
+        if self.sock is None:
+            return
+        self.unduck()
+        if self.watch is not None:
+            GLib.source_remove(self.watch)
+            self.watch = None
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.sock = None
+        self.clear()
+        self.emit()
+
+    def send(self, packet):
+        if self.sock is None:
+            return
+        try:
+            self.sock.send(packet)
+        except OSError:
+            self.disconnect()
+            self.schedule(2000)
+
+    # ---- what the AirPods say --------------------------------------------
+
+    def readable(self, _fd, condition):
+        if condition & (GLib.IO_HUP | GLib.IO_ERR):
+            self.watch = None
+            self.disconnect()
+            self.schedule(2000)
+            return False
+        try:
+            while True:
+                packet = self.sock.recv(2048)
+                if not packet:
+                    raise OSError("closed")
+                self.handle(packet)
+        except BlockingIOError:
+            pass
+        except OSError:
+            self.watch = None
+            self.disconnect()
+            self.schedule(2000)
+            return False
+        self.emit()
+        return True
+
+    def handle(self, p):
+        if len(p) < 7 or p[0:4] != b"\x04\x00\x04\x00":
+            return
+        opcode = p[4]
+        if opcode == 0x04:
+            self.on_battery(p)
+        elif opcode == 0x06 and len(p) >= 8:
+            self.on_ears([EARS.get(p[6], "out"), EARS.get(p[7], "out")])
+        elif opcode == 0x09 and len(p) >= 8:
+            identifier, value = p[6], p[7]
+            if identifier == CTL_MODE and value in MODES:
+                self.mode = MODES[value]
+            elif identifier == CTL_CONVERSATION:
+                self.conversation = value == 1
+            elif identifier == CTL_ALLOW_OFF:
+                self.allow_off = value == 1
+        elif opcode == 0x4B and len(p) >= 10:
+            self.on_speech(p[9])
+        elif opcode == 0x1D:
+            strings = p[10:].split(b"\x00")
+            if len(strings) > 1:
+                self.model = strings[1].decode("utf-8", "replace")
+
+    def on_battery(self, p):
+        battery = {}
+        for i in range(p[6]):
+            chunk = p[7 + 5 * i: 12 + 5 * i]
+            if len(chunk) < 5:
+                break
+            part = PARTS.get(chunk[0])
+            # A part the AirPods can't see reports no level worth showing.
+            if part is None or chunk[3] == 4 or chunk[2] > 100:
+                continue
+            battery[part] = {"level": chunk[2], "charging": chunk[3] == 1}
+        # The case drops out when its lid shuts. Keep what it last said.
+        if "case" not in battery and "case" in self.battery:
+            battery["case"] = dict(self.battery["case"], stale=True)
+        self.battery = battery
+
+    def on_ears(self, ears):
+        before = self.ears.count("ear")
+        self.ears = ears
+        now = ears.count("ear")
+        if not self.settings["autopause"]:
+            self.paused = []
+            return
+        if now < before and not self.paused:
+            self.paused = self.pause_players()
+        elif now > before and now == 2 and self.paused:
+            self.resume_players(self.paused)
+            self.paused = []
+        elif now == 0 and before == 0:
+            self.paused = []
+
+    def on_speech(self, level):
+        if not self.settings["duck"]:
+            return
+        if level in (1, 2):
+            self.duck()
+        elif level in (3, 8, 9):
+            self.unduck()
+
+    # ---- the rest of the desktop -----------------------------------------
+
+    def players(self):
+        if self.session is None:
+            self.session = dbus.SessionBus()
+        names = self.session.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus").ListNames(
+            dbus_interface="org.freedesktop.DBus")
+        return [str(n) for n in names if str(n).startswith("org.mpris.MediaPlayer2.")]
+
+    def pause_players(self):
+        paused = []
+        try:
+            for name in self.players():
+                player = self.session.get_object(name, "/org/mpris/MediaPlayer2")
+                status = player.Get("org.mpris.MediaPlayer2.Player", "PlaybackStatus",
+                                    dbus_interface="org.freedesktop.DBus.Properties")
+                if str(status) == "Playing":
+                    player.Pause(dbus_interface="org.mpris.MediaPlayer2.Player")
+                    paused.append(name)
+        except dbus.DBusException:
+            pass
+        return paused
+
+    def resume_players(self, names):
+        for name in names:
+            try:
+                player = self.session.get_object(name, "/org/mpris/MediaPlayer2")
+                player.Play(dbus_interface="org.mpris.MediaPlayer2.Player")
+            except dbus.DBusException:
+                pass
+
+    def volume(self):
+        try:
+            out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                                 capture_output=True, text=True, timeout=2).stdout.split()
+            return float(out[1])
+        except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+            return None
+
+    def set_volume(self, value):
+        try:
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "%.2f" % value], timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def duck(self):
+        if self.ducked is not None:
+            return
+        current = self.volume()
+        if current is None or current <= 0.05:
+            return
+        self.ducked = current
+        self.set_volume(current * 0.3)
+
+    def unduck(self):
+        if self.ducked is None:
+            return
+        self.set_volume(self.ducked)
+        self.ducked = None
+
+    # ---- what the bar asks for -------------------------------------------
+
+    def command(self, line):
+        words = line.split()
+        if not words:
+            return
+        verb, args = words[0], words[1:]
+        if verb == "mode" and args and args[0] in MODE_BYTES:
+            self.send(control(CTL_MODE, MODE_BYTES[args[0]]))
+        elif verb == "conversation" and args:
+            on = args[0] == "on"
+            self.send(control(CTL_CONVERSATION, 1 if on else 2))
+            # The AirPods don't echo this one back.
+            if self.sock is not None:
+                self.conversation = on
+            if not on:
+                self.unduck()
+        elif verb in ("autopause", "duck") and args:
+            self.settings[verb] = args[0] == "on"
+            self.save_settings()
+            if verb == "duck" and not self.settings["duck"]:
+                self.unduck()
+        elif verb == "connect":
+            self.connect_known()
+        elif verb == "sync":
+            self.last_line = ""
+            if self.sock is None:
+                self.error = ""
+                self.look()
+        self.emit()
+
+    def stdin_ready(self, _fd, condition):
+        if condition & (GLib.IO_HUP | GLib.IO_ERR):
+            self.quit()
+            return False
+        line = sys.stdin.readline()
+        if line == "":
+            self.quit()
+            return False
+        self.command(line.strip())
+        return True
+
+    def device_changed(self, interface, changed, _invalidated, path=None):
+        if interface != "org.bluez.Device1" or "Connected" not in changed:
+            return
+        if changed["Connected"]:
+            self.schedule(1500)
+        elif self.sock is not None and path and path.endswith(self.address.replace(":", "_")):
+            self.disconnect()
+
+    def quit(self):
+        self.unduck()
+        self.loop.quit()
+
+    def serve(self):
+        self.loop = GLib.MainLoop()
+        self.bus.add_signal_receiver(self.device_changed, "PropertiesChanged",
+                                     "org.freedesktop.DBus.Properties", "org.bluez",
+                                     path_keyword="path")
+        GLib.io_add_watch(sys.stdin.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.stdin_ready)
+        self.look()
+        self.emit()
+        try:
+            self.loop.run()
+        except KeyboardInterrupt:
+            pass
+        self.unduck()
+
+
+def once(command=None):
+    """Connect, optionally send one mode change, and print what comes back."""
+    backend = Backend(emit=False)
+    found = backend.find()
+    if not found:
+        print("No AirPods are connected.", file=sys.stderr)
+        return 1
+    try:
+        backend.connect(*found)
+    except OSError as error:
+        print("The AirPods refused the connection: %s" % error, file=sys.stderr)
+        return 1
+    loop = GLib.MainLoop()
+    if command:
+        GLib.timeout_add(600, lambda: backend.command(command) and False)
+    GLib.timeout_add(2000, loop.quit)
+    loop.run()
+    state = backend.state()
+    del state["type"]
+    print(json.dumps(state, indent=2))
+    return 0
+
+
+def main():
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    args = sys.argv[1:]
+    if args[:1] == ["serve"]:
+        Backend().serve()
+        return 0
+    if args[:1] == ["status"]:
+        return once()
+    if args[:1] == ["mode"] and len(args) == 2 and args[1] in MODE_BYTES:
+        return once("mode " + args[1])
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
