@@ -2,6 +2,8 @@
 
 Battery, noise control and in-ear pause for AirPods, as a bar widget.
 
+![AirPods widget panel](assets/widget.png)
+
 - **Bar:** an AirPods icon with the battery of the lower AirPod. It dims when
   none are connected. Scroll on it to step through the noise control modes.
 - **Panel:** battery of each AirPod and the case, the noise control mode
